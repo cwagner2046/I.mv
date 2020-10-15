@@ -1,0 +1,457 @@
+#!/usr/bin/env bash
+# -*- shell-script -*-
+#
+# (C) Christian Wagner
+
+## Spec:
+## option '-x' activates the "extended" mode.
+##
+## "Extended mode":
+## i.mv a b = mv a b
+## i.mv a b c = mv a b c
+##
+## i.mv -x [-c] a.suf b =
+##  | cp a.suf b.suf, iff -c is specified and b is not a directory
+##  | mv a.suf b.suf, iff b is not a directory
+##  | mv a.suf b, otherwise
+##
+## RE params:
+## i.mv -x [opts] +'RE1' +'RE2' =
+##  for f in `ls| sed -n '/RE1/p'`; n=`echo f| sed 's/RE1/RE2/g'`; mv f n; done
+##
+
+declare -r PRG_NAME=`basename $0`
+
+declare -ri T=0  # TRUE value
+declare -ri F=1  # FALSE value
+
+function syntax {
+    echo "Syntax: 
+  $PRG_NAME -h
+  $PRG_NAME [mopts] src1 [src2 ...] dest
+  $PRG_NAME -x [mopts | [-c [copts]]] src dest
+  $PRG_NAME -x [--prompt] [mopts | [-c [copts]]] [-s srcdir] [-d destdir]
+              [-g] {-r | -E} +'RE1' +'RE2'"
+}
+
+#123456789012345678901234567890123456789012345678901234567890123456789012345678
+function help {
+  echo "`syntax`
+
+where
+  -h displays the current information;
+  -x calls for an execution of 'i.mv' in extended mode;
+  --prompt causes 'i.mv' to ask confirmation of the requested action;
+  -c calls for a copy of the source file, 'i.mv' running in extended mode;
+  -g calls for RE2 to be globally substituted for RE1 in the file name(s);
+     default: only the 1st occurence of RE1 is replaced.
+  -s specifies the source directory when using REs and the source file(s) are
+     not to be found in the current directory;
+  -d specifies the destination directory when using REs
+  -r and -E call for using regular expressions (RE) instead of filenames;
+     NOTE: the program then looks for matching files in the *current* directory;
+  mopts are any legal 'mv' options (see man pages);
+  copts are any legal 'cp' options (see man pages);
+  RE1 is the regular expression specifiying the source file name(s);
+  RE2 is the regular expression specifiying the destination file name(s);.
+
+Moves, or copies, 'src' into 'dest'; or moves the source files 'src1', 'src2',
+etc, into the 'dest' directory.
+
+When moving several sources ('src1', 'src2', etc), the extended mode is NOT
+used, that is, 'i.mv' behaves as 'mv' would.
+
+When using the -r or the -E flags, the file name specifications are sed(1)
+regular expressions (-r flag) or extended regular expressions (-E flag). If
+the RE needs to include spaces, you should use extended RE and the '[:space:]'
+character class. For example:
+
+  $ ls
+  a b.txt       c.pdf
+  $ i.mv -xv -E '[[:space:]]' '_'
+  i.mv: moving 'a b.txt' to 'a_b.txt'
+  $ ls
+  a_b.txt       c.pdf
+
+One purpose of the extended mode is to avoid you having to provide the
+file extension of the destination. So rather than having to type in:
+
+  mv a.pdf b.pdf
+
+you can use this command:
+
+  i.mv -x a.pdf b
+
+which leads to the 'a.pdf' being moved into 'b.pdf'.
+
+A filename extension is understood to be the last sequence of characters after
+the rightmost dot.
+
+Another purpose of the extended mode is to allow renaming (or copying under
+new names) a series of files identified by RE1. In this case, the resulting file
+names are constructed by substituting RE2 into the original file names. In order
+for this to be possible, RE2 has to refer to patterns identified in RE1. For
+example:
+
+  i.mv -r '\(a\)\(b\).\(\.pdf\)' '\2\1\3'
+
+result in the file 'abc.pdf', in the current directory, being renamed 'ba.pdf'.
+WARNING: This also means that, were the current directory to contain the files
+'abc.pdf' and 'abD.pdf', only _one_ file would be renamed 'ba.pdf', the other
+one would be lost, overwritten.
+" | ${PAGER:-more}
+
+  exit 0
+}
+
+function exit_with {
+    echo $1 >&2
+    syntax >&2
+    exit $2
+}
+
+function unix_mv {
+    mv $@
+    exit $?
+}
+
+declare -r cp_idx=0
+declare -r mv_idx=1
+declare -ra cmds=(cp mv)
+declare -ra actions=(copying moving)
+
+function i_mv_file {
+    local -r cmd_idx=$1
+    local -r silent_execution=$2
+    local    opts=$3
+    local -r src=$4
+    local -r dest=$5
+    local    destdir=$6  # Will be modified by appending "/"
+
+    local -r cmd=${cmds[$cmd_idx]}
+    local -r action=${actions[$cmd_idx]}
+    local extension=${src/*\./}
+    if [[ $extension == $src ]]; then
+        extension=""
+    else
+        extension=".${extension}"
+    fi
+    if [[ $silent_execution -ne T ]]; then
+	echo "$PRG_NAME: $action '$src' to '${dest}${extension}'"
+    fi
+    if [[ -n $destdir ]]; then
+        destdir="${destdir}/"
+    fi
+    $cmd $opts $src ${destdir}${dest}${extension}
+    exit $?
+}
+
+function i_mv_with_RE {
+    declare -r cmd_idx=$1;           shift
+    declare -ri silent_execution=$1; shift
+    declare -ri prompt=$1;           shift
+    declare    opts=$1;              shift
+    declare -r sed_opts=$1;          shift
+    declare -r RE1=$1;               shift
+    declare -r RE2=$1;               shift
+    declare -r destdir=$1;           shift
+
+    declare -r cmd=${cmds[$cmd_idx]}
+    declare -r action=${actions[$cmd_idx]}
+    declare sed_program="sed -n"
+    declare -i use_RE=F              # use_RE is false by default
+    declare    sed_global_sub='null' # no global substitution by default
+    for o in $sed_opts; do
+	## We require that either -E or -r be specified when RE are intended to
+	## be used.
+	case $o in
+	    -g) sed_global_sub='g';;
+	    -E) if [[ $use_RE -eq T ]]; then
+		  exit_with "Options -r and -E are mutually exclusive." 1
+		else
+		  use_RE=T
+		fi
+		sed_program="$sed_program -E";;
+	    -r) if [[ $use_RE -eq T ]]; then
+		  exit_with "Options -r and -E are mutually exclusive." 1
+		else
+		  use_RE=T
+		fi
+	    # Other options that might be passed in are to be ignored.
+	esac
+    done
+    [[ $use_RE -eq F ]] && exit_with "Mandatory option (-E or -r) missing." 1
+
+    # meaning call syntax: "do_with_RE regexen action using ..."
+    do_with_RE \
+        "$RE1" "$RE2" $action $cmd "$opts" "$destdir" \
+        "$sed_program" $sed_global_sub $silent_execution $prompt 
+}
+
+
+function do_with_RE {
+    declare -r RE1=$1;               shift
+    declare -r RE2=$1;               shift
+    declare -r action=$1;            shift
+    declare -r cmd=$1;               shift
+    declare -r opts=$1;              shift
+    declare -r destdir=$1;           shift
+    declare -r sed_program=$1;       shift
+    declare    sed_global_sub=$1;    shift
+    declare -ri silent_execution=$1; shift
+    declare -ri prompt=$1
+
+    if [[ $sed_global_sub != 'g' ]]; then
+        unset sed_global_sub
+    fi
+    ## To speed up the lookup of file names matching $RE1, the output of 'ls'
+    ## is passed to 'sed', leaving the latter to produce the source name
+    ## and the destination name whenever the input matches $RE1. The output
+    ## of that pipeline is collected into an array (src_name dest_name ...).
+    ## Applying 'sed' only once is what makes the implementation fast.
+    ##
+    ## Since the source name may contain spaces, 'sed' cannot simply pass it
+    ## onto the output because the space-separated parts of such a name would
+    ## appear as separate elements in the resulting array. This is
+    ## exemplified by:
+    ##   declare -a array=(`echo "a b" c`)
+    ## results in array containing "a", "b" and "c" instead of "a b" and "c".
+    ##
+    ## Consequently, 'sed' is tasked with protecting space-like characters
+    ## found in the source name before associating it with the destination
+    ## name. At the time of moving the source file to its new destination,
+    ## 'tr' is used to revert the protection applied by 'sed'.
+    ## 
+
+## TODO:
+## - check handling of RE special chars when in RE1 or RE2.
+
+    declare -r es=`echo -e "\x1"` # escape character for ' '
+    declare -r et=`echo -e "\x2"`; declare -r tab=`echo -e "\t"`
+    declare -r ec=`echo -e "\x3"`; declare -r cr=`echo -e "\r"`
+    declare -r el=`echo -e "\x4"`; declare -r lf=`echo -e "\f"`
+    declare -r ev=`echo -e "\x5"`; declare -r vt=`echo -e "\v"`
+    declare -r en=`echo -e "\x6"`; declare -r nl=`echo -e "\n"`
+    declare -r sed_cmds="/$RE1/ {
+# Escape space-like characters and print the protected input:
+s/ /${es}/g
+s/${tab}/${et}/g
+s/${cr}/${ec}/g
+s/${lf}/${el}/g
+s/${vt}/${ev}/g
+s/${nl}/${en}/g
+p
+
+# Restore input to its initial state and output the resulting substitution:
+s/${es}/ /g
+s/${et}/${tab}/g
+s/${ec}/${cr}/g
+s/${el}/${lf}/g
+s/${ev}/${vt}/g
+s/${en}/${nl}/g
+s/$RE1/$RE2/${sed_global_sub}
+p
+}"
+
+    declare -a name=(`ls| $sed_program "$sed_cmds"`)
+    declare prompt_text
+    let -i i=0
+    let -i failures=0
+    while [ $i -lt ${#name[*]} ]; do
+	local src=`echo ${name[$i]} | \
+            tr "${es}${et}${ec}${el}${ev}${en}" " ${tab}${cr}${lf}${vt}${en}"`
+	(( i++ ))
+        local dest=${name[$i]}
+        if [ "$destdir" != "" ]; then
+	    dest="${destdir}/${dest}"
+        fi
+	(( i++ ))
+
+        if [[ $prompt -eq T ]]; then
+            if [[ -z $opts ]]; then
+                prompt_text="$cmd $src $dest? [y/n] "
+            else
+                prompt_text="$cmd $opts $src $dest? [y/n] "
+            fi
+            read -p "$prompt_text"
+            if [[ "$REPLY" != "y" && "$REPLY" != "Y" ]]; then
+                echo "skipped" >&2
+                continue
+            fi
+        elif [[ $silent_execution -ne T ]]; then
+	    echo "$PRG_NAME: $action '$src' to '$dest'"
+        fi
+
+        $cmd $opts "$src" "$dest"
+	if [[ $? -ne 0 ]]; then
+	    (( failures++ ))
+	fi
+    done
+
+    if [[ $failures -ne 0 ]]; then
+        exit 2
+    else
+        exit 0
+    fi
+}
+
+function i_mv {
+    declare cmd_idx=$mv_idx     # the default command is 'mv'
+    declare silent_execution=T  # no verbose execution by default
+    declare prompt=F            # no prompting before executing an action
+    declare mv_opts=''
+    declare substitution_opts=''
+    declare use_RE=F
+    while [[ $# -ne 0 ]]; do
+	case $1 in
+            --prompt) prompt=T;;
+            # When silent_execution is not null, we simulates cp's and mv's
+            # "-v" option because we capture their output for the sake of
+            # aggregating a status report when executing i_mv_with_RE:
+	    -v) silent_execution=F;;
+	    -c) cmd_idx=$cp_idx;;
+            -d) shift;
+                local -r dest_dir=$1
+                [[ ! -d $dest_dir ]] && \
+                    exit_with \
+                "Invalid directory name spec. with -d option ('$dest_dir') " \
+                        1 ;;
+	    -s) shift;
+		local -r src_dir=$1
+		[[ ! -d $src_dir ]] && \
+		    exit_with \
+	         "Invalid directory name spec. with -s option ('$src_dir') " \
+		    1 ;;
+	    -g|-r|-E) use_RE=T
+                      substitution_opts="$substitution_opts $1";;
+	    -?*) mv_opts="$mv_opts $1";;
+            +?*) ## regexen specification: when the arg. is +'a"b"c', $1 passed
+                 ## to this CASE branch as +a"b"c, i.e., the outside quotes
+                 ## (single or double) are removed from $1.
+                 ## 
+                 ## The leading '+' char. is not to be stored in src and dest.
+                if [[ -n $src && -n $dest ]]; then
+                    if [[ $use_RE -eq T ]]; then
+                        local msg="Invalid spec. of regular expression: found extra argument ($1)"
+                    else
+                        local msg="Invalid filename spec. with -x option: found extra argument ('$1')"
+                    fi
+                    exit_with "$msg" 1
+                elif [[ -z $src ]]; then
+                    if [[ $use_RE -eq T ]]; then
+                        local -r src=${1:1}
+                    else
+                        local -r src=$1
+                    fi
+                else
+                    if [[ $use_RE -eq T ]]; then
+                        local -r dest=${1:1}
+                    else
+                        local -r dest=$1
+                    fi
+                fi
+                ;;
+	    *) if [[  -n $src  && -n $dest ]]; then
+		    exit_with \
+        "Invalid filename spec. with -x option: found extra argument ('$1')" 1
+		elif [[ -z $src ]]; then
+		    local -r src=$1
+		else
+		    local -r dest=$1
+		fi
+	esac
+	shift
+    done
+    if [[ -z $src || -z $dest ]]; then
+        if [[ -z $substitution_opts ]]; then
+            exit_with "Missing specification: source or destination" 1
+        else
+            exit_with "Missing specification: regular expressions RE1 or RE2" 1
+        fi
+    fi
+
+    ## A modern version of Bash will ensure that the working directory upon
+    ## executing this script will be restored after the execution. There are
+    ## actions to take in this program to ensure that said working directory
+    ## will be restored.
+    if [[ "$src_dir" != "" ]]; then
+        pushd $src_dir > /dev/null 2>&1 || exit 1
+    fi
+    
+    # WARNING: any arg. which may be empty or containing white-spaces must
+    # be enclosed between double-quotes
+    if [[ -z $substitution_opts ]]; then
+	i_mv_file $cmd_idx \
+                  $silent_execution "$mv_opts" "$src" "$dest" "$dest_dir"
+    else
+	# Regular expressions must be passed enclosed in double-quotes to
+	# prevent Bash from interpreting them here.
+	i_mv_with_RE $cmd_idx \
+	             $silent_execution $prompt \
+                     "$mv_opts" "$substitution_opts" "$src" "$dest" "$dest_dir"
+    fi
+}
+
+function rename {
+    declare extended_mode=F # no execution in extended mode by default
+    declare args=''
+    # Quickly lookup option "-x" on the command line:
+    while [[ $# -ne 0 ]]; do
+	case $1 in
+	    -h) help;; # calling on 'help' ends the program execution
+	    -x) extended_mode=T
+		shift
+		args="$args $@"
+		break;;
+	    *) args="$args $1"
+		shift;;
+	esac
+    done
+
+    if [[ $extende_mode -eq T ]]; then
+        local -r last=${args/* /} # extracts the last arg. in 'args'
+        if [[ -d $last ]]; then
+	    exit_with \
+	      "Second regular expression ($last) cannot be a directory name!" \
+	      1
+        else
+	   args="$args"
+        fi
+    fi
+    # We never return from the application of the command:
+    if [[ $extended_mode -eq T ]]; then
+	i_mv $args
+    else
+	unix_mv $args
+    fi
+}
+
+function separate_options {
+    declare a=$1
+    declare opt_list=''
+    while [[ "$a" != '' ]]; do
+	local c=${a:0:1}
+	opt_list="$opt_list -${c}"
+	a=${a#${c}}
+    done
+    echo "$opt_list"
+}
+
+## Restore a string of options into a list of options (e.g., "-abc --e a" is
+## expanded into "-a -b -c --e a"), protecting the new option style (prefixed
+## with a double dash).  
+function expand_args {
+    declare args=''
+    while [[ $# -ne 0 ]]; do
+	case $1 in
+	    --*) args="$args@$1";;
+	    -?*) args="$args@$(separate_options ${1#-})";;
+	    *) args="$args@$1";;
+	esac
+	shift
+    done
+    echo $args | sed 's/@/ /g'
+}
+
+# rename() never returns, so there's no status to report after its execution.
+rename $(expand_args $@)
