@@ -126,7 +126,8 @@ function i_mv_file {
     local    opts=$3
     local -r src=$4
     local -r dest=$5
-    local    destdir=$6  # Will be modified by appending "/"
+    local -r srcdir=$6
+    local    destdir=$7 # Will be modified by appending "/"
 
     local -r cmd=${cmds[$cmd_idx]}
     local -r action=${actions[$cmd_idx]}
@@ -137,12 +138,12 @@ function i_mv_file {
         extension=".${extension}"
     fi
     if [[ $silent_execution -ne T ]]; then
-	echo "$PRG_NAME: $action '$src' to '${dest}${extension}'"
+	echo "$PRG_NAME: $action '$srcdir/$src' to '${dest}${extension}'"
     fi
     if [[ -n $destdir ]]; then
         destdir="${destdir}/"
     fi
-    $cmd $opts $src ${destdir}${dest}${extension}
+    $cmd $opts $srcdir/$src ${destdir}${dest}${extension}
     exit $?
 }
 
@@ -154,11 +155,12 @@ function i_mv_with_RE {
     declare -r sed_opts=$1;          shift
     declare -r RE1=$1;               shift
     declare -r RE2=$1;               shift
+    declare -r srcdir=$1;            shift
     declare -r destdir=$1;           shift
 
     declare -r cmd=${cmds[$cmd_idx]}
     declare -r action=${actions[$cmd_idx]}
-    declare sed_program="sed -n"
+    declare    sed_program="sed -n"
     declare -i use_RE=F              # use_RE is false by default
     declare    sed_global_sub='null' # no global substitution by default
     for o in $sed_opts; do
@@ -182,9 +184,9 @@ function i_mv_with_RE {
     done
     [[ $use_RE -eq F ]] && exit_with "Mandatory option (-E or -r) missing." 1
 
-    # meaning call syntax: "do_with_RE regexen action using ..."
+    # meaning of call syntax: "do_with_RE regexen action using ..."
     do_with_RE \
-        "$RE1" "$RE2" $action $cmd "$opts" "$destdir" \
+        "$RE1" "$RE2" $action $cmd "$opts" "$srcdir" "$destdir" \
         "$sed_program" $sed_global_sub $silent_execution $prompt 
 }
 
@@ -195,6 +197,7 @@ function do_with_RE {
     declare -r action=$1;            shift
     declare -r cmd=$1;               shift
     declare -r opts=$1;              shift
+    declare -r srcdir=$1;            shift
     declare -r destdir=$1;           shift
     declare -r sed_program=$1;       shift
     declare    sed_global_sub=$1;    shift
@@ -209,6 +212,12 @@ function do_with_RE {
     ## and the destination name whenever the input matches $RE1. The output
     ## of that pipeline is collected into an array (src_name dest_name ...).
     ## Applying 'sed' only once is what makes the implementation fast.
+    ##
+    ## Note that the piping of the output of 'ls' is the only way I can think of
+    ## to be robust and cope with file names containing white-spaces. The other
+    ## methods of processing the output of 'ls' would not handle such white-
+    ## spaces correctly; a file name with one white-space would be processed
+    ## as 2 words.
     ##
     ## Since the source name may contain spaces, 'sed' cannot simply pass it
     ## onto the output because the space-separated parts of such a name would
@@ -233,6 +242,9 @@ function do_with_RE {
     declare -r ev=`echo -e "\x5"`; declare -r vt=`echo -e "\v"`
     declare -r en=`echo -e "\x6"`; declare -r nl=`echo -e "\n"`
     declare -r sed_cmds="/$RE1/ {
+# store the input in the hold space for later use:
+h
+
 # Escape space-like characters and print the protected input:
 s/ /${es}/g
 s/${tab}/${et}/g
@@ -242,26 +254,32 @@ s/${vt}/${ev}/g
 s/${nl}/${en}/g
 p
 
-# Restore input to its initial state and output the resulting substitution:
-s/${es}/ /g
-s/${et}/${tab}/g
-s/${ec}/${cr}/g
-s/${el}/${lf}/g
-s/${ev}/${vt}/g
-s/${en}/${nl}/g
+# Restore input to its initial state and produce the substitution. Load the input
+# from the hold space into the pattern space and apply the substitution, if any:
+g
 s/$RE1/$RE2/${sed_global_sub}
+
+# and finally escape space-like characters in the substitution:
+s/ /${es}/g
+s/${tab}/${et}/g
+s/${cr}/${ec}/g
+s/${lf}/${el}/g
+s/${vt}/${ev}/g
+s/${nl}/${en}/g
 p
 }"
-
-    declare -a name=(`ls| $sed_program "$sed_cmds"`)
+    # Name is a list of pairs: filename1 new_name1 [filename2 new_name2 ...]
+    declare -a name=(`ls $srcdir| $sed_program "$sed_cmds"`)            
     declare prompt_text
     let -i i=0
     let -i failures=0
     while [ $i -lt ${#name[*]} ]; do
 	local src=`echo ${name[$i]} | \
             tr "${es}${et}${ec}${el}${ev}${en}" " ${tab}${cr}${lf}${vt}${en}"`
+        src="$srcdir/$src"
 	(( i++ ))
-        local dest=${name[$i]}
+        local dest=`echo ${name[$i]} | \
+            tr "${es}${et}${ec}${el}${ev}${en}" " ${tab}${cr}${lf}${vt}${en}"`
         if [ "$destdir" != "" ]; then
 	    dest="${destdir}/${dest}"
         fi
@@ -370,25 +388,23 @@ function i_mv {
         fi
     fi
 
-    ## A modern version of Bash will ensure that the working directory upon
-    ## executing this script will be restored after the execution. There are
-    ## actions to take in this program to ensure that said working directory
-    ## will be restored.
-    if [[ "$src_dir" != "" ]]; then
-        pushd $src_dir > /dev/null 2>&1 || exit 1
+    if [[ -z $src_dir ]]; then
+        local -r src_dir="."
     fi
     
     # WARNING: any arg. which may be empty or containing white-spaces must
     # be enclosed between double-quotes
     if [[ -z $substitution_opts ]]; then
 	i_mv_file $cmd_idx \
-                  $silent_execution "$mv_opts" "$src" "$dest" "$dest_dir"
+                  $silent_execution "$mv_opts" "$src" "$dest" \
+                  "$src_dir" "$dest_dir"
     else
 	# Regular expressions must be passed enclosed in double-quotes to
 	# prevent Bash from interpreting them here.
 	i_mv_with_RE $cmd_idx \
 	             $silent_execution $prompt \
-                     "$mv_opts" "$substitution_opts" "$src" "$dest" "$dest_dir"
+                     "$mv_opts" "$substitution_opts" "$src" "$dest" \
+                     "$src_dir" "$dest_dir"
     fi
 }
 
