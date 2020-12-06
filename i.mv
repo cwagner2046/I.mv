@@ -126,9 +126,6 @@ function i_mv_file {
     local    opts=$3
     local -r src=$4
     local -r dest=$5
-    local -r srcdir=$6
-    local    destdir=$7 # Will be modified by appending "/"
-
     local -r cmd=${cmds[$cmd_idx]}
     local -r action=${actions[$cmd_idx]}
     local extension=${src/*\./}
@@ -137,13 +134,11 @@ function i_mv_file {
     else
         extension=".${extension}"
     fi
+
     if [[ $silent_execution -ne T ]]; then
-	echo "$PRG_NAME: $action '$srcdir/$src' to '${dest}${extension}'"
+	echo "$PRG_NAME: $action $src' to '${dest}${extension}'"
     fi
-    if [[ -n $destdir ]]; then
-        destdir="${destdir}/"
-    fi
-    $cmd $opts $srcdir/$src ${destdir}${dest}${extension}
+     $cmd $opts $src ${dest}${extension}
     exit $?
 }
 
@@ -155,8 +150,8 @@ function i_mv_with_RE {
     declare -r sed_opts=$1;          shift
     declare -r RE1=$1;               shift
     declare -r RE2=$1;               shift
-    declare -r srcdir=$1;            shift
-    declare -r destdir=$1;           shift
+    declare -r src_prefix=$1;        shift
+    declare -r dest_prefix=$1;       shift
 
     declare -r cmd=${cmds[$cmd_idx]}
     declare -r action=${actions[$cmd_idx]}
@@ -186,7 +181,7 @@ function i_mv_with_RE {
 
     # meaning of call syntax: "do_with_RE regexen action using ..."
     do_with_RE \
-        "$RE1" "$RE2" $action $cmd "$opts" "$srcdir" "$destdir" \
+        "$RE1" "$RE2" $action $cmd "$opts" "$src_prefix" "$dest_prefix" \
         "$sed_program" $sed_global_sub $silent_execution $prompt 
 }
 
@@ -197,8 +192,8 @@ function do_with_RE {
     declare -r action=$1;            shift
     declare -r cmd=$1;               shift
     declare -r opts=$1;              shift
-    declare -r srcdir=$1;            shift
-    declare -r destdir=$1;           shift
+    declare -r src_prefix=$1;        shift
+    declare -r dest_prefix=$1;       shift
     declare -r sed_program=$1;       shift
     declare    sed_global_sub=$1;    shift
     declare -ri silent_execution=$1; shift
@@ -269,20 +264,18 @@ s/${nl}/${en}/g
 p
 }"
     # Name is a list of pairs: filename1 new_name1 [filename2 new_name2 ...]
-    declare -a name=(`ls $srcdir| $sed_program "$sed_cmds"`)            
+    declare -a name=(`ls $src_prefix| $sed_program "$sed_cmds"`)            
     declare prompt_text
     let -i i=0
     let -i failures=0
     while [ $i -lt ${#name[*]} ]; do
 	local src=`echo ${name[$i]} | \
             tr "${es}${et}${ec}${el}${ev}${en}" " ${tab}${cr}${lf}${vt}${en}"`
-        src="$srcdir/$src"
+        src="${src_prefix}${src}"
 	(( i++ ))
         local dest=`echo ${name[$i]} | \
             tr "${es}${et}${ec}${el}${ev}${en}" " ${tab}${cr}${lf}${vt}${en}"`
-        if [ "$destdir" != "" ]; then
-	    dest="${destdir}/${dest}"
-        fi
+	dest="${dest_prefix}$dest"
 	(( i++ ))
 
         if [[ $prompt -eq T ]]; then
@@ -322,6 +315,20 @@ function target_or_RE {
     fi
 }
 
+## If we want to be able to write ${src-or-dest_prefix}${filename},
+## the adjustment of the source or destination directory arg. is:
+## - arg=/ => dest_prefix=arg
+## - arg=path/ => dest_prefix=arg
+## - arg=path/dirname => dest_prefix=arg/
+function adjust_dirname {
+    case $1 in
+        '') local -r prefix='./';; # default value            
+        */) local -r prefix=$1;;
+        *) local -r prefix="$1/";;
+    esac
+    echo "$prefix"
+}
+
 function i_mv {
     declare cmd_idx=$mv_idx     # the default command is 'mv'
     declare silent_execution=T  # no verbose execution by default
@@ -338,17 +345,16 @@ function i_mv {
 	    -v) silent_execution=F;;
 	    -c) cmd_idx=$cp_idx;;
             -d) shift;
-                local -r dest_dir=$1
-                [[ ! -d $dest_dir ]] && \
+                [[ ! -d $1 ]] && \
                     exit_with \
-                "Invalid directory name spec. with -d option ('$dest_dir') " \
-                        1 ;;
+                        "Invalid directory name spec. with -d option ('$1') " 1
+                local -r destdir=$1;;
+            
 	    -s) shift;
-		local -r src_dir=$1
-		[[ ! -d $src_dir ]] && \
+		[[ ! -d $1 ]] && \
 		    exit_with \
-	         "Invalid directory name spec. with -s option ('$src_dir') " \
-		    1 ;;
+	                "Invalid directory name spec. with -s option ('$1') " 1
+                local -r srcdir=$1;;
 	    -g|-r|-E) use_RE=T
                       substitution_opts="$substitution_opts $1";;
 	    -?*) mv_opts="$mv_opts $1";;
@@ -389,23 +395,22 @@ function i_mv {
         fi
     fi
 
-    if [[ -z $src_dir ]]; then
-        local -r src_dir="."
-    fi
-    
     # WARNING: any arg. which may be empty or containing white-spaces must
     # be enclosed between double-quotes
     if [[ -z $substitution_opts ]]; then
 	i_mv_file $cmd_idx \
-                  $silent_execution "$mv_opts" "$src" "$dest" \
-                  "$src_dir" "$dest_dir"
+                  $silent_execution "$mv_opts" "$src" "$dest"
+
     else
+        local -r src_prefix=`adjust_dirname $srcdir`
+        local -r dest_prefix=`adjust_dirname $destir`
+
 	# Regular expressions must be passed enclosed in double-quotes to
 	# prevent Bash from interpreting them here.
 	i_mv_with_RE $cmd_idx \
 	             $silent_execution $prompt \
                      "$mv_opts" "$substitution_opts" "$src" "$dest" \
-                     "$src_dir" "$dest_dir"
+                     "$src_prefix" "$dest_prefix"
     fi
 }
 
